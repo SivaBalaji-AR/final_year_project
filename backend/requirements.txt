@@ -1,0 +1,7 @@
+livekit-agents
+livekit-plugins-assemblyai
+livekit-plugins-google
+livekit-plugins-silero
+python-dotenv
+fastapi
+uvicorn
