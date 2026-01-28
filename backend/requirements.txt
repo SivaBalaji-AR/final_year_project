@@ -1,7 +1,15 @@
+livekit
 livekit-agents
 livekit-plugins-assemblyai
 livekit-plugins-google
 livekit-plugins-silero
+livekit-plugins-cartesia
+livekit-plugins-turn-detector
+livekit-plugins-noise-cancellation
 python-dotenv
 fastapi
-uvicorn
+uvicorn[standard]
+pydantic
+aiohttp
+websockets
+httpx
