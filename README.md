@@ -15,11 +15,14 @@ LIVEKIT_API_KEY=your_api_key
 LIVEKIT_API_SECRET=your_api_secret
 ASSEMBLYAI_API_KEY=your_assemblyai_key
 GOOGLE_API_KEY=your_gemini_api_key
+CARTESIA_API_KEY=your_cartesia_api_key
 ```
 
 ### Frontend (`frontend/.env.local`)
 ```env
 NEXT_PUBLIC_LIVEKIT_URL=wss://your-project.livekit.cloud
+LIVEKIT_API_KEY=your_api_key
+LIVEKIT_API_SECRET=your_api_secret
 ```
 
 ## Running the App
