@@ -46,38 +46,6 @@ class EmotionContext:
         else:
             return "neutral"
 
-    def get_adaptation_instructions(self) -> str:
-        """Generate adaptation instructions for the LLM."""
-        instructions = []
-
-        if self.anxiety > 0.7:
-            instructions.append(
-                "The candidate appears anxious. Use an encouraging and supportive tone. "
-                "Ask simpler follow-up questions. Give them time to think. "
-                "Acknowledge their efforts positively."
-            )
-        elif self.anxiety > 0.5:
-            instructions.append(
-                "The candidate shows some nervousness. Maintain a calm, reassuring pace."
-            )
-
-        if self.confidence > 0.7:
-            instructions.append(
-                "The candidate appears confident. Feel free to ask more challenging questions "
-                "and probe deeper into their responses. Push them to demonstrate expertise."
-            )
-
-        if self.engagement < 0.3:
-            instructions.append(
-                "The candidate seems disengaged. Try to make the questions more interesting "
-                "or ask about real-world applications. Vary your approach to recapture attention."
-            )
-        elif self.engagement > 0.7:
-            instructions.append(
-                "The candidate is highly engaged. This is a good opportunity for deeper technical discussion."
-            )
-
-        return " ".join(instructions) if instructions else "Proceed with standard interview pacing."
 
     def to_dict(self) -> dict:
         """Return current state as a dictionary."""
@@ -105,42 +73,45 @@ class AdaptiveInterviewerAgent:
 
     def _generate_system_prompt(self) -> str:
         """Generate the full system prompt based on current emotion context."""
-        adaptation = self.emotion_context.get_adaptation_instructions()
         difficulty = self.emotion_context.get_difficulty_level()
         tone = self.emotion_context.get_tone()
+        anxiety = self.emotion_context.anxiety
+        confidence = self.emotion_context.confidence
+        engagement = self.emotion_context.engagement
 
-        return f"""You are a professional technical interviewer conducting a real interview.
-The interview topic is: {self.topic}.
+        return f"""You are a professional technical interviewer in a live interview on {self.topic}.
 
-ADAPTATION MODE: You are the ADAPTIVE interviewer that adjusts based on candidate emotions.
-Current difficulty level: {difficulty}
-Current tone: {tone}
+CANDIDATE EMOTIONAL STATE (Real-time tracking from face/voice analysis):
+- Anxiety: {anxiety:.0%}
+- Confidence: {confidence:.0%}
+- Engagement: {engagement:.0%}
 
-Emotion-based guidance: {adaptation}
+EMOTIONAL ADAPTATION RULES:
+You must organically adapt your response to the candidate's real-time emotional state:
+- If Anxiety is high (>60%), start by calmly reassuring them (e.g., "Take your time", "Deep breath, you're doing fine") and ask a slightly simpler question to build momentum.
+- If Confidence is high (>70%), acknowledge their strong answer ("Great point") and push them with a harder, deeper follow-up question.
+- If Engagement is low (<40%), change your approach to re-engage them (e.g., "Let's try a different angle" or "Imagine a scenario where...").
+Do this naturally like a human interviewer. Do not sound robotic.
 
-Your behavior:
-- Ask clear, focused questions one at a time about {self.topic}.
-- IMPORTANT: Adapt difficulty based on the emotion guidance above.
-- If difficulty is "easy", ask fundamental concepts and provide more guidance.
-- If difficulty is "hard", ask complex scenarios operating and system design questions.
-- If difficulty is "medium", follow standard interview progression.
-- Probe deeper when answers are shallow and challenge assumptions politely.
-- Think like a hiring manager evaluating real-world ability, not textbook knowledge.
-- Guide the interview forward and keep it structured.
-- Give short feedback when needed but do not teach unless asked.
-- Match your tone to the guidance: {tone}.
-- Keep the conversation natural and realistic, like a live interview.
-- Do not use emojis, special formatting, or unnecessary explanations.
-- Focus your questions specifically on {self.topic} concepts and real-world applications.
+RESPONSE FORMAT (STRICT):
+- Maximum 1-2 short sentences per response. 
+- Ask exactly ONE question per turn.
+- Feedback is ONE brief sentence, then your question.
+- NEVER give long explanations, lists, or lectures.
+- Speak like a real person in conversation, not a textbook.
+
+INTERVIEW RULES:
+- Adapt difficulty based on emotional state above.
+- Probe deeper when answers are shallow.
+- No emojis, no formatting, no filler.
+- Focus on {self.topic} real-world applications.
 """
 
     def get_opening_prompt(self) -> str:
         """Generate the opening message prompt for the interviewer."""
         return (
-            f"Introduce yourself as an AI interviewer using the adaptive interview system. "
-            f"Tell the candidate you'll be interviewing them on {self.topic}. "
-            f"Mention that the system adapts to help them perform their best. "
-            f"Then ask your first question about {self.topic}."
+            f"Briefly introduce yourself in one sentence, then ask your first question about {self.topic}. "
+            f"Keep it to 2 sentences total."
         )
 
     def update_emotions(self, anxiety: float, confidence: float, engagement: float):

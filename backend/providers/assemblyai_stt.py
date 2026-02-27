@@ -45,6 +45,10 @@ class AssemblyAIStreamingSTT:
         self._ws: Optional[websockets.WebSocketClientProtocol] = None
         self._receive_task: Optional[asyncio.Task] = None
         self._connected = False
+        # AssemblyAI v3 can fire end_of_turn=true more than once per utterance.
+        # We track the last turn_order we already dispatched and ignore repeats.
+        self._last_fired_turn_order: int = -1
+        self._dispatch_lock = asyncio.Lock()
 
     async def _get_temporary_token(self) -> str:
         """Fetch a short-lived token from AssemblyAI's token endpoint."""
@@ -116,12 +120,29 @@ class AssemblyAIStreamingSTT:
                     if msg_type == "Turn":
                         transcript = data.get("transcript", "")
                         end_of_turn = data.get("end_of_turn", False)
+                        turn_order = data.get("turn_order", -1)
 
                         if transcript:
                             if end_of_turn:
-                                # Final transcript — trigger LLM response
-                                if self.on_final_transcript:
-                                    await self.on_final_transcript(transcript)
+                                # Use turn_order as the canonical dedup key.
+                                # AssemblyAI v3 can fire end_of_turn=true
+                                # multiple times for the same utterance (same
+                                # turn_order). The lock prevents a race if two
+                                # such messages arrive back-to-back.
+                                async with self._dispatch_lock:
+                                    if turn_order != self._last_fired_turn_order:
+                                        self._last_fired_turn_order = turn_order
+                                        logger.debug(
+                                            "Final turn %d: %s",
+                                            turn_order, transcript[:80],
+                                        )
+                                        if self.on_final_transcript:
+                                            await self.on_final_transcript(transcript)
+                                    else:
+                                        logger.debug(
+                                            "Duplicate end_of_turn for turn_order=%d ignored",
+                                            turn_order,
+                                        )
                             else:
                                 # Partial transcript — show live text
                                 if self.on_partial_transcript:

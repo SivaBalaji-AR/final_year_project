@@ -68,7 +68,7 @@ class GroqLLM:
                 model=self.model_name,
                 messages=messages,
                 temperature=0.7,
-                max_tokens=1024,
+                max_tokens=256,
             )
 
             response_text = response.choices[0].message.content.strip()

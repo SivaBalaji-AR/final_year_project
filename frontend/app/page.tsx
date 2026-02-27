@@ -241,6 +241,8 @@ function InterviewPage({
 
   // ─── Server Message Handler ───────────────────────────────────────────────
 
+  const flushAndPlayRef = useRef<() => void>(() => { });
+
   const handleServerMessage = useCallback((data: any) => {
     switch (data.type) {
       case "transcript":
@@ -262,6 +264,10 @@ function InterviewPage({
         break;
       case "status":
         setAgentStatus(data.status);
+        // done_speaking = all chunks received, play them now
+        if (data.status === "done_speaking") {
+          flushAndPlayRef.current();
+        }
         break;
       case "error":
         console.error("Server error:", data.message);
@@ -270,61 +276,76 @@ function InterviewPage({
   }, []);
 
   // ─── Audio Playback ───────────────────────────────────────────────────────
+  //
+  // Strategy: collect all binary PCM chunks while the agent is speaking,
+  // then play the full concatenated buffer on done_speaking. Dead simple.
 
+  const pendingChunksRef = useRef<ArrayBuffer[]>([]);
   const playbackCtxRef = useRef<AudioContext | null>(null);
-  const audioQueueRef = useRef<ArrayBuffer[]>([]);
-  const isPlayingRef = useRef(false);
-  const stoppedRef = useRef(false);
-  const nextPlayTimeRef = useRef(0);
+  const currentSourceRef = useRef<AudioBufferSourceNode | null>(null);
 
+  // Called for every binary WebSocket frame (raw PCM s16le chunk)
   const handleAudioPlayback = useCallback((buffer: ArrayBuffer) => {
-    if (stoppedRef.current) return;
-    audioQueueRef.current.push(buffer);
-    if (!isPlayingRef.current) playAudioQueue();
+    pendingChunksRef.current.push(buffer);
   }, []);
 
-  const playAudioQueue = useCallback(async () => {
-    if (isPlayingRef.current) return;
-    isPlayingRef.current = true;
+  // Called when done_speaking fires — play everything we have
+  const flushAndPlay = useCallback(async () => {
+    const chunks = pendingChunksRef.current;
+    pendingChunksRef.current = [];
+    if (chunks.length === 0) return;
 
-    if (!playbackCtxRef.current) {
-      playbackCtxRef.current = new AudioContext({ sampleRate: SAMPLE_RATE });
+    // Concatenate all chunks into one Int16Array
+    const totalSamples = chunks.reduce((n, b) => n + b.byteLength / 2, 0);
+    const combined = new Int16Array(totalSamples);
+    let offset = 0;
+    for (const chunk of chunks) {
+      combined.set(new Int16Array(chunk), offset);
+      offset += chunk.byteLength / 2;
     }
-    const ctx = playbackCtxRef.current;
 
-    while (audioQueueRef.current.length > 0 && !stoppedRef.current) {
-      const buf = audioQueueRef.current.shift()!;
-      const int16 = new Int16Array(buf);
-      const float32 = new Float32Array(int16.length);
-      for (let i = 0; i < int16.length; i++) float32[i] = int16[i] / 32768.0;
+    // Convert to float32
+    const float32 = new Float32Array(totalSamples);
+    for (let i = 0; i < totalSamples; i++) float32[i] = combined[i] / 32768.0;
 
-      const audioBuf = ctx.createBuffer(1, float32.length, SAMPLE_RATE);
+    try {
+      // Lazy-create (or reuse) AudioContext
+      if (!playbackCtxRef.current || playbackCtxRef.current.state === "closed") {
+        playbackCtxRef.current = new AudioContext({ sampleRate: SAMPLE_RATE });
+      }
+      const ctx = playbackCtxRef.current;
+
+      if (ctx.state === "suspended") await ctx.resume();
+
+      const audioBuf = ctx.createBuffer(1, totalSamples, SAMPLE_RATE);
       audioBuf.getChannelData(0).set(float32);
+
+      // Stop any currently playing audio
+      if (currentSourceRef.current) {
+        try { currentSourceRef.current.stop(); } catch (_) { }
+        currentSourceRef.current = null;
+      }
 
       const src = ctx.createBufferSource();
       src.buffer = audioBuf;
       src.connect(ctx.destination);
-
-      // Schedule buffers back-to-back using precise timing to avoid gaps
-      const now = ctx.currentTime;
-      const startAt = Math.max(now, nextPlayTimeRef.current);
-      src.start(startAt);
-      nextPlayTimeRef.current = startAt + audioBuf.duration;
-
-      // Wait for this chunk to finish (with small overlap for queue check)
-      await new Promise<void>((resolve) => {
-        setTimeout(resolve, (audioBuf.duration * 1000) + 10);
-      });
+      currentSourceRef.current = src;
+      src.start(0);
+      console.log(`[TTS] Playing ${(totalSamples / SAMPLE_RATE).toFixed(2)}s of audio`);
+    } catch (err) {
+      console.error("[TTS] Playback error:", err);
     }
-
-    isPlayingRef.current = false;
   }, []);
 
+  // Keep ref in sync so handleServerMessage (stale closure) always calls latest
+  useEffect(() => { flushAndPlayRef.current = flushAndPlay; }, [flushAndPlay]);
+
   const stopAllAudio = useCallback(() => {
-    stoppedRef.current = true;
-    audioQueueRef.current = [];
-    isPlayingRef.current = false;
-    nextPlayTimeRef.current = 0;
+    pendingChunksRef.current = [];
+    if (currentSourceRef.current) {
+      try { currentSourceRef.current.stop(); } catch (_) { }
+      currentSourceRef.current = null;
+    }
     if (playbackCtxRef.current) {
       playbackCtxRef.current.close().catch(() => { });
       playbackCtxRef.current = null;
