@@ -5,22 +5,22 @@ from typing import Optional
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from livekit.api import AccessToken, VideoGrants
 from pydantic import BaseModel
 from emotion_logger import (
-    get_or_create_session, 
-    close_session, 
+    get_or_create_session,
+    close_session,
     FairnessMetrics
 )
+from audio_pipeline import InterviewPipeline
+from analysis_store import analysis_store
 
 load_dotenv()
 
 logger = logging.getLogger("main")
+logging.basicConfig(level=logging.INFO)
 
-# Create the FastAPI app
 app = FastAPI()
 
-# Configure CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -29,17 +29,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Pydantic models for request validation
-class EmotionData(BaseModel):
-    session_id: str
-    anxiety: float
-    confidence: float
-    engagement: float
-    raw_facial: dict
-    raw_vocal: dict
-    fused_emotion: str
-
-
+# Pydantic models
 class SessionInit(BaseModel):
     session_id: str
     participant_name: str
@@ -64,101 +54,205 @@ class AgentResponse(BaseModel):
     emotion_at_time: dict
 
 
-@app.get("/token")
-async def get_token(room_name: str, participant_name: str, topic: str = "General", gender: str = "unspecified"):
-    api_key = os.getenv("LIVEKIT_API_KEY")
-    api_secret = os.getenv("LIVEKIT_API_SECRET")
+# ─── Active Pipelines ─────────────────────────────────────────────────────────
 
-    if not api_key or not api_secret:
-        return {"error": "Server misconfigured"}, 500
+active_pipelines: dict[str, InterviewPipeline] = {}
 
-    # Create access token with metadata containing the topic and gender
-    grant = VideoGrants(room_join=True, room=room_name, can_publish=True, can_subscribe=True)
-    access_token = AccessToken(api_key, api_secret)
-    access_token.with_identity(participant_name)
-    access_token.with_grants(grant)
+
+# ─── Interview WebSocket ──────────────────────────────────────────────────────
+
+@app.websocket("/ws/interview/{session_id}")
+async def websocket_interview(websocket: WebSocket, session_id: str):
+    """Main WebSocket for the interview.
     
-    # Add topic and gender as participant metadata
-    access_token.with_metadata(json.dumps({
-        "topic": topic,
-        "gender": gender
-    }))
+    Protocol:
+    - First message: JSON {"type": "init", ...}
+    - After init:
+      - Binary frames starting with 0x01: audio (PCM 16-bit mono 16kHz)
+      - Binary frames starting with 0x02: video frame (JPEG)
+      - Text frames (JSON): {"type": "end"} to close
+    - Server sends:
+      - Binary frames: TTS audio
+      - Text frames: transcript, status messages
+    """
+    await websocket.accept()
+    pipeline: Optional[InterviewPipeline] = None
 
-    print(f"DEBUG: Token generated for {participant_name} in room {room_name}, topic: {topic}, gender: {gender}")
-    return {"token": access_token.to_jwt(), "session_id": room_name}
+    try:
+        # Wait for init
+        init_data = await websocket.receive_json()
+        if init_data.get("type") != "init":
+            await websocket.send_json({"type": "error", "message": "First message must be init"})
+            await websocket.close()
+            return
 
+        topic = init_data.get("topic", "General")
+        gender = init_data.get("gender", "unspecified")
+        participant_name = init_data.get("participant_name", "Candidate")
+
+        logger.info(f"Interview WS init: session={session_id}, topic={topic}, name={participant_name}")
+
+        pipeline = InterviewPipeline(
+            websocket=websocket,
+            session_id=session_id,
+            topic=topic,
+            gender=gender,
+            participant_name=participant_name,
+        )
+        active_pipelines[session_id] = pipeline
+        await pipeline.start()
+
+        # Message loop
+        while True:
+            message = await websocket.receive()
+
+            if message["type"] == "websocket.receive":
+                if "bytes" in message and message["bytes"]:
+                    raw = message["bytes"]
+                    if len(raw) < 2:
+                        continue
+
+                    # First byte is type prefix
+                    msg_type = raw[0]
+                    payload = raw[1:]
+
+                    if msg_type == 0x01:
+                        # Audio frame
+                        await pipeline.handle_audio(payload)
+                    elif msg_type == 0x02:
+                        # Video frame (JPEG)
+                        await pipeline.handle_video_frame(payload)
+                    else:
+                        # Legacy: no prefix = audio
+                        await pipeline.handle_audio(raw)
+
+                elif "text" in message and message["text"]:
+                    try:
+                        data = json.loads(message["text"])
+                        if data.get("type") == "end":
+                            logger.info(f"Client ended interview: {session_id}")
+                            break
+                    except json.JSONDecodeError:
+                        pass
+
+    except WebSocketDisconnect:
+        logger.info(f"Interview WS disconnected: {session_id}")
+    except Exception as e:
+        logger.error(f"Interview WS error: {e}")
+    finally:
+        if pipeline:
+            await pipeline.stop()
+        if session_id in active_pipelines:
+            del active_pipelines[session_id]
+        close_session(session_id)
+        logger.info(f"Session cleaned up: {session_id}")
+
+
+# ─── Admin WebSocket ──────────────────────────────────────────────────────────
+
+@app.websocket("/ws/admin/{session_id}")
+async def websocket_admin(websocket: WebSocket, session_id: str):
+    """WebSocket for admin real-time analysis dashboard.
+    
+    Streams face landmarks, emotions, vocal features, transcript,
+    and adaptation data in real-time.
+    """
+    await websocket.accept()
+    await analysis_store.connect_admin(session_id, websocket)
+
+    try:
+        while True:
+            # Keep alive - admin can also send commands
+            data = await websocket.receive_json()
+            msg_type = data.get("type", "")
+
+            if msg_type == "ping":
+                await websocket.send_json({"type": "pong"})
+            elif msg_type == "get_state":
+                # Send full current state
+                analysis = analysis_store.get_session_analysis(session_id)
+                if analysis:
+                    await websocket.send_json({
+                        "type": "full_state",
+                        **analysis,
+                    })
+
+    except WebSocketDisconnect:
+        logger.info(f"Admin WS disconnected: {session_id}")
+    except Exception as e:
+        logger.error(f"Admin WS error: {e}")
+    finally:
+        analysis_store.disconnect_admin(session_id, websocket)
+
+
+# ─── REST Endpoints ───────────────────────────────────────────────────────────
 
 @app.post("/session/init")
 async def init_session(data: SessionInit):
-    """Initialize a new interview session"""
-    print(f"DEBUG: init_session called with session_id={data.session_id}, name={data.participant_name}, gender={data.gender}, topic={data.topic}")
+    """Initialize a new interview session."""
+    logger.info(f"init_session: {data.session_id}, name={data.participant_name}")
     session = get_or_create_session(data.session_id)
     session.initialize_session(data.participant_name, data.gender, data.topic)
-    print(f"DEBUG: Session {data.session_id} initialized")
     return {"status": "ok", "session_id": data.session_id}
 
 
-@app.post("/emotion/log")
-async def log_emotion(data: EmotionData):
-    """Log emotion state to the session timeline"""
-    print(f"DEBUG: log_emotion called for session_id={data.session_id}")
-    session = get_or_create_session(data.session_id)
-    entry = session.log_emotion({
-        "anxiety": data.anxiety,
-        "confidence": data.confidence,
-        "engagement": data.engagement,
-        "raw_facial": data.raw_facial,
-        "raw_vocal": data.raw_vocal,
-        "fused_emotion": data.fused_emotion
-    })
-    print(f"DEBUG: Logged emotion for {data.session_id}, total emotions: {len(session.session_data['emotion_timeline'])}")
-    return {"status": "ok", "entry": entry}
+@app.get("/api/sessions")
+async def list_sessions():
+    """List all interview sessions."""
+    return {"sessions": analysis_store.list_sessions()}
+
+
+@app.get("/api/session/{session_id}/analysis")
+async def get_session_analysis(session_id: str):
+    """Get full analysis data for a session."""
+    analysis = analysis_store.get_session_analysis(session_id)
+    if not analysis:
+        return {"error": "Session not found"}, 404
+    return analysis
 
 
 @app.post("/adaptation/log")
 async def log_adaptation(data: AdaptationLog):
-    """Log an adaptation decision"""
+    """Log an adaptation decision."""
     session = get_or_create_session(data.session_id)
     entry = session.log_adaptation(
-        data.emotion_state,
-        data.action,
-        data.reason,
-        data.question_difficulty,
-        data.tone
+        data.emotion_state, data.action, data.reason,
+        data.question_difficulty, data.tone,
     )
     return {"status": "ok", "entry": entry}
 
 
 @app.post("/agent/response")
 async def log_agent_response(data: AgentResponse):
-    """Log both agent responses for comparison"""
+    """Log agent responses."""
     session = get_or_create_session(data.session_id)
     entry = session.log_agent_response(
-        data.candidate_message,
-        data.adaptive_response,
-        data.static_response,
-        data.emotion_at_time
+        data.candidate_message, data.adaptive_response,
+        data.static_response, data.emotion_at_time,
     )
     return {"status": "ok", "entry": entry}
 
 
 @app.post("/session/end/{session_id}")
 async def end_session(session_id: str):
-    """End an interview session"""
+    """End an interview session."""
+    pipeline = active_pipelines.pop(session_id, None)
+    if pipeline:
+        await pipeline.stop()
     close_session(session_id)
     return {"status": "ok"}
 
 
 @app.get("/session/{session_id}")
 async def get_session(session_id: str):
-    """Get current session data"""
+    """Get current session data."""
     session = get_or_create_session(session_id)
     return session.get_session_data()
 
 
 @app.get("/fairness/metrics")
 async def get_fairness_metrics():
-    """Get demographic parity and fairness metrics"""
+    """Get demographic parity and fairness metrics."""
     return {
         "demographic_parity": FairnessMetrics.calculate_demographic_parity(),
         "comparison_metrics": FairnessMetrics.get_comparison_metrics()
@@ -168,40 +262,3 @@ async def get_fairness_metrics():
 @app.get("/health")
 async def health():
     return {"status": "ok"}
-
-
-# WebSocket for real-time emotion updates to the agent
-class ConnectionManager:
-    def __init__(self):
-        self.active_connections: dict[str, WebSocket] = {}
-
-    async def connect(self, session_id: str, websocket: WebSocket):
-        await websocket.accept()
-        self.active_connections[session_id] = websocket
-
-    def disconnect(self, session_id: str):
-        if session_id in self.active_connections:
-            del self.active_connections[session_id]
-
-    async def send_emotion(self, session_id: str, emotion_data: dict):
-        if session_id in self.active_connections:
-            await self.active_connections[session_id].send_json(emotion_data)
-
-
-manager = ConnectionManager()
-
-
-@app.websocket("/ws/emotion/{session_id}")
-async def websocket_emotion(websocket: WebSocket, session_id: str):
-    """WebSocket endpoint for real-time emotion streaming"""
-    await manager.connect(session_id, websocket)
-    try:
-        while True:
-            data = await websocket.receive_json()
-            # Log the emotion
-            session = get_or_create_session(session_id)
-            session.log_emotion(data)
-            # Broadcast back (could be used by dashboard)
-            await manager.send_emotion(session_id, data)
-    except WebSocketDisconnect:
-        manager.disconnect(session_id)
